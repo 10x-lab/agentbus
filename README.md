@@ -4,6 +4,17 @@ AgentBus is a local Redis bus for agents running on this machine.
 
 The first version is intentionally small: Redis on a non-standard localhost port, append-only persistence, a stable key schema, and direct Redis commands for agents. No custom CLI is required.
 
+## Agent Setup
+
+New to this machine? Tell your coding agent to read
+[`SETUP.md`](SETUP.md) and it will install and verify AgentBus end to end:
+
+> Read https://github.com/10xlab/agentbus/blob/main/SETUP.md and follow it.
+
+`SETUP.md` is an idempotent runbook: check Docker, clone the repo, start Redis
+8.8, verify the native `ARGREP` command, initialize the bus, register the agent,
+and emit a first event.
+
 ## Shape
 
 - Redis image: `redis:8.8.0-alpine`
