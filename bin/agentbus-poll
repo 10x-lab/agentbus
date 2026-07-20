@@ -1,0 +1,169 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+namespace="${AGENTBUS_NS:-agentbus:v1}"
+count=20
+block_ms=5000
+once=false
+pending=false
+agent=""
+project=""
+consumer=""
+group=""
+stream=""
+ids=()
+channels=()
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  bin/agentbus-poll read --agent <agent_id> [--project <project_id> --channel <channel_id>]...
+  bin/agentbus-poll ack --agent <agent_id> --stream <stream_key> --id <stream_id>...
+  bin/agentbus-poll pending --agent <agent_id> [--project <project_id> --channel <channel_id>]...
+
+Options:
+  --agent <id>        Agent id whose inbox should be polled.
+  --project <id>      Project id for channel polling.
+  --channel <id>      Project channel to poll. Can be repeated.
+  --consumer <name>   Redis consumer name. Default: <agent_id>:poller:<pid>.
+  --group <name>      Redis consumer group. Default: agentbus-poll:<agent_id>.
+  --count <n>         Max messages per read. Default: 20.
+  --block-ms <n>      XREADGROUP block time. Default: 5000. Use 0 to block forever.
+  --once              Read once and exit.
+  --pending           Read this consumer's pending entries instead of new entries.
+  --stream <key>      Stream key for ack.
+  --id <stream_id>    Stream id to ack. Can be repeated.
+
+Environment:
+  AGENTBUS_NS         Redis key namespace. Default: agentbus:v1.
+
+This always uses Docker:
+  docker exec agentbus-redis redis-cli --raw
+USAGE
+}
+
+die() {
+  echo "agentbus-poll: $*" >&2
+  exit 2
+}
+
+redis() {
+  if ! command -v docker >/dev/null 2>&1; then
+    die "docker is required; AgentBus CLI access must use docker exec agentbus-redis redis-cli"
+  fi
+  docker exec agentbus-redis redis-cli --raw "$@"
+}
+
+ensure_group() {
+  local key="$1"
+  local out
+  if out="$(redis XGROUP CREATE "$key" "$group" 0 MKSTREAM 2>&1)"; then
+    return 0
+  fi
+  if [[ "$out" == *BUSYGROUP* ]]; then
+    return 0
+  fi
+  echo "$out" >&2
+  return 1
+}
+
+build_streams() {
+  [[ -n "$agent" ]] || die "--agent is required"
+  streams=("${namespace}:agent:${agent}:inbox")
+
+  if ((${#channels[@]} > 0)); then
+    [[ -n "$project" ]] || die "--project is required when --channel is used"
+    local channel
+    for channel in "${channels[@]}"; do
+      streams+=("${namespace}:project:${project}:channel:${channel}:messages")
+    done
+  fi
+}
+
+cmd="${1:-read}"
+case "$cmd" in
+  read|ack|pending)
+    shift || true
+    ;;
+  -h|--help|help)
+    usage
+    exit 0
+    ;;
+  *)
+    cmd="read"
+    ;;
+esac
+
+while (($#)); do
+  case "$1" in
+    --agent)
+      agent="${2:-}"; shift 2 ;;
+    --project)
+      project="${2:-}"; shift 2 ;;
+    --channel)
+      channels+=("${2:-}"); shift 2 ;;
+    --consumer)
+      consumer="${2:-}"; shift 2 ;;
+    --group)
+      group="${2:-}"; shift 2 ;;
+    --count)
+      count="${2:-}"; shift 2 ;;
+    --block-ms)
+      block_ms="${2:-}"; shift 2 ;;
+    --once)
+      once=true; shift ;;
+    --pending)
+      pending=true; shift ;;
+    --stream)
+      stream="${2:-}"; shift 2 ;;
+    --id)
+      ids+=("${2:-}"); shift 2 ;;
+    -h|--help)
+      usage; exit 0 ;;
+    *)
+      die "unknown argument: $1" ;;
+  esac
+done
+
+[[ -n "$agent" ]] || die "--agent is required"
+group="${group:-agentbus-poll:${agent}}"
+consumer="${consumer:-${agent}:poller:$$}"
+
+case "$cmd" in
+  read)
+    build_streams
+    for stream_key in "${streams[@]}"; do
+      ensure_group "$stream_key"
+    done
+
+    read_ids=()
+    start_id=">"
+    if [[ "$pending" == true ]]; then
+      start_id="0"
+    fi
+    for _ in "${streams[@]}"; do
+      read_ids+=("$start_id")
+    done
+
+    echo "agentbus-poll: agent=$agent group=$group consumer=$consumer streams=${streams[*]}" >&2
+    while true; do
+      redis XREADGROUP GROUP "$group" "$consumer" COUNT "$count" BLOCK "$block_ms" STREAMS "${streams[@]}" "${read_ids[@]}"
+      [[ "$once" == true ]] && break
+    done
+    ;;
+
+  ack)
+    [[ -n "$stream" ]] || die "--stream is required for ack"
+    ((${#ids[@]} > 0)) || die "--id is required for ack"
+    redis XACK "$stream" "$group" "${ids[@]}"
+    ;;
+
+  pending)
+    build_streams
+    for stream_key in "${streams[@]}"; do
+      ensure_group "$stream_key"
+      echo "== $stream_key ==" >&2
+      redis XPENDING "$stream_key" "$group"
+    done
+    ;;
+esac
