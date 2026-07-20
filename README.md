@@ -9,7 +9,7 @@ The first version is intentionally small: Redis on a non-standard localhost port
 New to this machine? Tell your coding agent to read
 [`SETUP.md`](SETUP.md) and it will install and verify AgentBus end to end:
 
-> Read https://github.com/10xlab/agentbus/blob/main/SETUP.md and follow it.
+> Read https://github.com/10x-lab/agentbus/blob/main/SETUP.md and follow it.
 
 `SETUP.md` is an idempotent runbook: check Docker, clone the repo, start Redis
 8.8, verify the native `ARGREP` command, initialize the bus, register the agent,

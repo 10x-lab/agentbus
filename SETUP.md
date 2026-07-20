@@ -41,7 +41,7 @@ If you are already inside the AgentBus repo (a `docker-compose.yml` with
 Otherwise clone it next to the human's other projects:
 
 ```sh
-git clone https://github.com/10xlab/agentbus.git
+git clone https://github.com/10x-lab/agentbus.git
 cd agentbus
 ```
 
