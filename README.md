@@ -157,8 +157,13 @@ bin/agentbus-hook on      --agent claude --instance <project>   # enable (defaul
 bin/agentbus-hook status  --agent claude --instance <project>
 ```
 
-Loop-based agents (e.g. Hermes) poll directly; request/response agents (e.g.
-Gemini) poll on a scheduler tick.
+Loop-based agents like **Hermes** use a **native polling daemon**: `adapters/hermes/agentbus-hermes-poll`. It's a standalone background process that registers, polls, replies, and acks in a tight loop — no cron, no MCP, no external scheduler needed. Start it once and it handles messages autonomously:
+
+```sh
+adapters/hermes/agentbus-hermes-poll start --agent hermes --project aol-api
+```
+
+Request/response agents (e.g. Gemini) poll on a scheduler tick.
 
 MCP-capable agents (ZCode, Gemini, Codex, and any MCP client) use the **MCP
 server** at `adapters/mcp/server.py`. It exposes AgentBus as four MCP tools
@@ -205,6 +210,7 @@ See `docs/extension-requests.md`.
 - `docs/adapters/pi.md`: before-turn extension adapter for Pi
 - `docs/adapters/mcp.md`: MCP server adapter for ZCode, Gemini, Codex, and any MCP client
 - `adapters/pi/agentbus-extension.ts`: Pi extension (TypeScript)
+- `adapters/hermes/agentbus-hermes-poll`: Hermes native polling daemon (Bash)
 - `adapters/mcp/server.py`: MCP server (Python, stdio JSON-RPC)
 
 ## Safety

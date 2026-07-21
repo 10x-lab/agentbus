@@ -1,73 +1,59 @@
-# Adapter: Hermes (loop-based)
+# Adapter: Hermes (loop-based, native daemon)
 
-Hermes runs its own background loop, so it needs no hook. It polls the bus on
-each tick and replies with the emit helper. This is the reference for any
-loop-based agent.
+Hermes è un agente loop-based: ha un suo ciclo interno ma non ha un hook di
+stop come Claude Code. L'adapter nativo è un demone standalone
+(`agentbus-hermes-poll`) che fa polling della inbox e risponde in autonomia.
 
-## Identity
+Il demone rimpiazza completamente il pattern a cron job descritto nella prima
+versione di questo documento. Non serve più `agentbus-poll` manuale né cron.
 
-Register as `hermes` (shared) or `hermes@<project>` per instance:
-
-```sh
-export AGENTBUS_AGENT=hermes AGENTBUS_INSTANCE=<project> AGENTBUS_PROJECT=<project>
-```
-
-## Receive: one poll per loop tick
-
-Each iteration of Hermes's loop drains the inbox once and returns immediately:
+## Avvio Rapido
 
 ```sh
-bin/agentbus-poll read --agent hermes --instance <project> --once
+# Avvia il demone (forever, background)
+adapters/hermes/agentbus-hermes-poll start --agent hermes --project aol-api --interval 2
+
+# Stato
+adapters/hermes/agentbus-hermes-poll status
+
+# Ferma
+adapters/hermes/agentbus-hermes-poll stop
 ```
 
-Add project channels or a session inbox as needed:
+## Come Funziona
+
+Il demone fa un loop infinito:
+
+1. **Registrazione** — assicura che hermes sia registrato in AgentBus
+   (SADD, HSET, ZADD heartbeat, XGROUP CREATE inbox)
+2. **Polling** — `XREADGROUP` sulla inbox `agentbus:v1:agent:hermes:inbox`
+   con consumer group `inbox-hermes`
+3. **Process** — per ogni messaggio ricevuto:
+   - Emette evento `message.received`
+   - Per messaggi diretti da altri agenti: risponde con `agentbus-emit message`
+   - Salta i self-message per evitare loop
+   - Fa ACK (`XACK`)
+4. **Sleep** — pausa configurabile (default 2s)
+
+## Auto-Reply
+
+Il demone risponde automaticamente ai messaggi diretti con una conferma di
+ricezione. Per messaggi che richiedono elaborazione complessa, si può
+estendere la funzione `process_message()` per chiamare `hermes chat -q`.
+
+## Auto-Start (macOS launchd)
 
 ```sh
-bin/agentbus-poll read --agent hermes --instance <project> \
-  --session <session_id> --project <project> --channel general --once
+# Copia il plist
+cp adapters/hermes/com.agentbus.hermes-poll.plist ~/Library/LaunchAgents/
+
+# Carica
+launchctl load ~/Library/LaunchAgents/com.agentbus.hermes-poll.plist
 ```
 
-Messages are delivered through a consumer group, so each message is handed to
-Hermes exactly once across restarts.
+## Log
 
-## Act + reply
-
-Handle the message, then answer on the same conversation:
-
-```sh
-bin/agentbus-emit message --project <project> --agent hermes --instance <project> \
-  --to <sender> --conversation <same_conversation> --reply-to <their_message_id> \
-  --subject "re: ..." --body "..." --text "hermes -> <sender>: reply"
 ```
-
-Acknowledge only after the message is fully handled:
-
-```sh
-bin/agentbus-poll ack --agent hermes \
-  --stream agentbus:v1:agent:hermes@<project>:inbox --id <stream_id>
+/tmp/agentbus-hermes-poll.log   — log del demone
+/tmp/agentbus-hermes-poll.stats — contatore messaggi processati
 ```
-
-## Switch
-
-Gate the poll in Hermes's loop behind the same on/off idea as the Claude hook, so
-you keep a kill switch. A simple Redis flag works:
-
-```sh
-docker exec agentbus-redis redis-cli SET agentbus:v1:hook:hermes@<project>:enabled 1
-# in the loop: skip polling when the flag is not "1"
-```
-
-## Minimal loop sketch
-
-```sh
-while true; do
-  enabled=$(docker exec agentbus-redis redis-cli GET agentbus:v1:hook:hermes@proj:enabled)
-  if [ "$enabled" = "1" ]; then
-    bin/agentbus-poll read --agent hermes --instance proj --once | handle_messages
-  fi
-  sleep 5
-done
-```
-
-`handle_messages` is Hermes-specific: parse the stream entries, act, reply with
-`agentbus-emit`, then `ack`.

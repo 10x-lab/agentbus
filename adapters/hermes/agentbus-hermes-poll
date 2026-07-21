@@ -1,0 +1,369 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# agentbus-hermes-poll — Native Hermes adapter for AgentBus
+# Loop-based agent: polls inbox, processes messages, replies, acks.
+#
+# Usage:
+#   agentbus-hermes-poll start   [--agent <id>] [--project <id>] [--interval <s>]
+#   agentbus-hermes-poll stop
+#   agentbus-hermes-poll status
+#   agentbus-hermes-poll poll    [--once]  (one-shot poll from CLI)
+#   agentbus-hermes-poll install [--agent <id>] [--project <id>]
+#
+# Environment:
+#   AGENTBUS_AGENT    default: hermes
+#   AGENTBUS_PROJECT  default: (none)
+#   AGENTBUS_INTERVAL default: 3 (seconds between polls)
+#
+# Stop: sends SIGTERM to the running daemon (PID file in /tmp).
+# Status: shows PID, uptime, messages processed.
+
+namespace="${AGENTBUS_NS:-agentbus:v1}"
+agent="${AGENTBUS_AGENT:-hermes}"
+project="${AGENTBUS_PROJECT:-}"
+interval="${AGENTBUS_INTERVAL:-3}"
+count=20
+block_ms=2000
+
+PID_FILE="/tmp/agentbus-hermes-poll.pid"
+CONF_FILE="/tmp/agentbus-hermes-poll.conf"
+LOG_FILE="/tmp/agentbus-hermes-poll.log"
+STATS_FILE="/tmp/agentbus-hermes-poll.stats"
+SELF="$(cd "$(dirname "$0")" && pwd)/agentbus-hermes-poll"
+AGENTBUS_BIN="$(cd "$(dirname "$0")/../../bin" && pwd)"
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+die()  { echo "agentbus-hermes-poll: $*" >&2; exit 2; }
+redis() { docker exec agentbus-redis redis-cli --raw "$@"; }
+log()  { echo "[$(date -u +%H:%M:%S)] $*" >> "$LOG_FILE"; }
+stats() { echo "$1" >> "$STATS_FILE"; }
+
+usage() {
+  cat <<USAGE
+agentbus-hermes-poll — Native Hermes adapter for AgentBus
+
+Usage:
+  $0 start    Start the polling daemon (background)
+  $0 stop     Stop the daemon
+  $0 status   Show daemon status
+  $0 poll     One-shot inbox read (foreground)
+  $0 install  Print setup instructions
+
+Options:
+  --agent <id>      Agent id (default: hermes)
+  --project <id>    Project slug  
+  --interval <s>    Poll interval in seconds (default: 3)
+  --once            One-shot poll (with poll command)
+
+Environment:
+  AGENTBUS_NS, AGENTBUS_AGENT, AGENTBUS_PROJECT, AGENTBUS_INTERVAL
+USAGE
+}
+
+# ---------------------------------------------------------------------------
+# Registration (idempotent)
+# ---------------------------------------------------------------------------
+ensure_registered() {
+  local ts epoch
+  ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  epoch=$(date -u +%s)
+
+  redis SADD "${namespace}:agents" "$agent" >/dev/null 2>&1 || true
+  redis HSET "${namespace}:agent:${agent}" id "$agent" kind coding-agent host local updated_at "$ts" >/dev/null
+  redis ZADD "${namespace}:agents:heartbeat" "$epoch" "$agent" >/dev/null
+
+  if [[ -n "$project" ]]; then
+    redis SADD "${namespace}:projects" "$project" >/dev/null 2>&1 || true
+    local cwd="${AGENTBUS_CWD:-$(pwd)}"
+    redis HSET "${namespace}:project:${project}" id "$project" name "$project" path "$cwd" updated_at "$ts" >/dev/null
+    redis HSET "${namespace}:projects:by_path" "$cwd" "$project" >/dev/null 2>&1 || true
+    redis ZADD "${namespace}:projects:active" "$epoch" "$project" >/dev/null
+  fi
+
+  redis XGROUP CREATE "${namespace}:agent:${agent}:inbox" "inbox-${agent}" 0 MKSTREAM >/dev/null 2>&1 || true
+}
+
+# ---------------------------------------------------------------------------
+# Poll
+# ---------------------------------------------------------------------------
+poll_inbox() {
+  local raw
+  raw=$(redis XREADGROUP GROUP "inbox-${agent}" "${agent}-poll-$$" \
+    COUNT "$count" BLOCK "$block_ms" STREAMS "${namespace}:agent:${agent}:inbox" ">" 2>/dev/null || true)
+
+  [[ -z "$raw" ]] && return 0
+
+  # Parse raw output with indexed array
+  local lines=()
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    lines+=("$line")
+  done <<< "$raw"
+
+  local idx=0
+  local total=${#lines[@]}
+
+  while (( idx < total )); do
+    stream_key="${lines[idx]}"; ((idx++))
+    [[ -z "$stream_key" ]] && continue
+    stream_id="${lines[idx]}"; ((idx++))
+    [[ -z "$stream_id" || "$stream_id" == ">" ]] && continue
+
+    # Collect fields into a flat string
+    local entry="${stream_key}|${stream_id}"
+    while (( idx < total )); do
+      local k="${lines[idx]}"
+      # Detect next stream key (contains ":" and no space, not numeric-only)
+      if [[ "$k" == *:* && "$k" != *\ * && ! "$k" =~ ^[0-9-]+$ ]]; then
+        break
+      fi
+      ((idx++))
+      local v="${lines[idx]:-}"
+      ((idx++))
+      entry+="|${k}=${v}"
+    done
+    process_message "$entry"
+  done
+}
+
+ack_message() {
+  local stream="$1" id="$2"
+  redis XACK "$stream" "inbox-${agent}" "$id" >/dev/null 2>&1 || true
+}
+
+process_message() {
+  local entry="$1"
+  local stream="" sid="" from="" msg_type="" subject="" body="" conv="" msg_id="" text=""
+
+  # Parse pipe-delimited entry: stream_key|stream_id|key=val|key=val|...
+  IFS='|' read -ra parts <<< "$entry"
+  stream="${parts[0]}"
+  sid="${parts[1]}"
+
+  local j=2
+  while (( j < ${#parts[@]} )); do
+    local part="${parts[j]}"
+    ((j++))
+    [[ -z "$part" || "$part" != *"="* ]] && continue
+    local k="${part%%=*}"
+    local v="${part#*=}"
+    case "$k" in
+      from)         from="$v" ;;
+      type)         msg_type="$v" ;;
+      subject)      subject="$v" ;;
+      body)         body="$v" ;;
+      conversation) conv="$v" ;;
+      message_id)   msg_id="$v" ;;
+      text)         text="$v" ;;
+    esac
+  done
+
+  log "MSG from=$from type=$msg_type subject=\"$subject\" id=$sid"
+
+  # Emit event
+  "$AGENTBUS_BIN/agentbus-emit" event \
+    --project "${project:-agentbus}" --agent "$agent" \
+    --type message.received --level info \
+    --text "hermes <- $from: $subject" >/dev/null 2>&1 || true
+
+  # Acknowledge
+  ack_message "$stream" "$sid"
+
+  # Simple auto-reply for direct messages (skip self-messages to avoid loops)
+  if [[ "$msg_type" == "message.direct" && -n "$from" && -n "$conv" && -n "$msg_id" ]]; then
+    # Don't reply to ourselves
+    if [[ "$from" == "$agent" ]]; then
+      log "SKIP self-message from=$from"
+      return 0
+    fi
+    local reply_body="Ricevuto. Sono hermes (polling attivo)."
+    [[ -n "$subject" ]] && reply_body+=" Oggetto: \"$subject\"."
+
+    "$AGENTBUS_BIN/agentbus-emit" message \
+      --project "${project:-agentbus}" --agent "$agent" \
+      --to "$from" --conversation "$conv" --reply-to "$msg_id" \
+      --subject "Re: ${subject:-messaggio}" \
+      --body "$reply_body" \
+      --text "hermes -> $from: conferma ricezione" >/dev/null 2>&1 || true
+
+    log "REPLY to=$from conv=$conv"
+  fi
+
+  stats "processed|$from|$msg_type"
+}
+
+# ---------------------------------------------------------------------------
+# Daemon
+# ---------------------------------------------------------------------------
+run_daemon() {
+  log "START agent=$agent project=${project:-'(none)'} interval=${interval}s pid=$$"
+
+  while true; do
+    ensure_registered
+    poll_inbox
+    sleep "$interval"
+  done
+}
+
+start_daemon() {
+  if [[ -f "$PID_FILE" ]]; then
+    local pid
+    pid=$(cat "$PID_FILE" 2>/dev/null || true)
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      die "already running (PID $pid)"
+    fi
+    rm -f "$PID_FILE"
+  fi
+
+  # Export + background self
+  export AGENTBUS_NS AGENTBUS_AGENT AGENTBUS_PROJECT AGENTBUS_INTERVAL
+  AGENTBUS_NS="$namespace"
+  AGENTBUS_AGENT="$agent"
+  AGENTBUS_PROJECT="$project"
+  AGENTBUS_INTERVAL="$interval"
+
+  # Save config for status
+  cat > "$CONF_FILE" <<EOF
+agent=$agent
+project=$project
+interval=$interval
+EOF
+
+  nohup "$SELF" _run_daemon </dev/null >>"$LOG_FILE" 2>&1 &
+  local daemon_pid=$!
+
+  sleep 0.5
+  if kill -0 "$daemon_pid" 2>/dev/null; then
+    echo "$daemon_pid" > "$PID_FILE"
+    echo "agentbus-hermes-poll: started (PID $daemon_pid, interval ${interval}s)"
+    log "DAEMON PID=$daemon_pid"
+  else
+    die "failed to start (check $LOG_FILE)"
+  fi
+}
+
+stop_daemon() {
+  if [[ ! -f "$PID_FILE" ]]; then
+    echo "agentbus-hermes-poll: not running"
+    return 0
+  fi
+  local pid
+  pid=$(cat "$PID_FILE" 2>/dev/null || true)
+  if [[ -z "$pid" ]]; then
+    rm -f "$PID_FILE"
+    echo "agentbus-hermes-poll: not running (stale PID file cleaned)"
+    return 0
+  fi
+  if kill "$pid" 2>/dev/null; then
+    log "STOP (signal sent to PID $pid)"
+    rm -f "$PID_FILE" "$CONF_FILE"
+    echo "agentbus-hermes-poll: stopped (PID $pid)"
+  else
+    rm -f "$PID_FILE" "$CONF_FILE"
+    echo "agentbus-hermes-poll: process already gone (cleaned)"
+  fi
+}
+
+show_status() {
+  if [[ -f "$PID_FILE" ]]; then
+    local pid
+    pid=$(cat "$PID_FILE" 2>/dev/null || true)
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      # Read config for accurate values
+      if [[ -f "$CONF_FILE" ]]; then
+        source "$CONF_FILE" 2>/dev/null || true
+      fi
+      echo "agentbus-hermes-poll: RUNNING (PID $pid)"
+      echo "  agent:    ${agent:-hermes}"
+      echo "  project:  ${project:-(none)}"
+      echo "  interval: ${interval:-3}s"
+      if [[ -f "$STATS_FILE" ]]; then
+        local processed
+        processed=$(wc -l < "$STATS_FILE" | tr -d ' ')
+        echo "  messages: $processed processed"
+      fi
+      echo "  log:      $LOG_FILE"
+      return 0
+    fi
+  fi
+  echo "agentbus-hermes-poll: STOPPED"
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+cmd="${1:-status}"
+case "$cmd" in
+  start|stop|status|poll|install|_run_daemon) shift || true ;;
+  -h|--help|help) usage; exit 0 ;;
+  *) die "unknown command: $cmd (try: start, stop, status, poll, install)" ;;
+esac
+
+while (($#)); do
+  case "$1" in
+    --agent)     agent="${2:-hermes}"; shift 2 ;;
+    --project)   project="${2:-}"; shift 2 ;;
+    --interval)  interval="${2:-3}"; shift 2 ;;
+    --once)      once=true; shift ;;
+    -h|--help)   usage; exit 0 ;;
+    *) die "unknown argument: $1" ;;
+  esac
+done
+
+case "$cmd" in
+  start)
+    ensure_registered
+    start_daemon
+    ;;
+  stop)
+    stop_daemon
+    ;;
+  status)
+    show_status
+    ;;
+  poll)
+    ensure_registered
+    echo "agentbus-hermes-poll: one-shot poll (agent=$agent project=${project:-(none)})"
+    poll_inbox
+    echo "Done."
+    ;;
+  install)
+    cat <<INSTALL
+
+agentbus-hermes-poll — Native Hermes adapter for AgentBus
+
+Start the daemon:
+  $SELF start --agent hermes --project aol-api --interval 3
+
+Stop:
+  $SELF stop
+
+Status:
+  $SELF status
+
+One-shot poll:
+  $SELF poll --agent hermes --once
+
+Auto-start on login (macOS launchd):
+  cp adapters/hermes/com.agentbus.hermes-poll.plist ~/Library/LaunchAgents/
+  launchctl load ~/Library/LaunchAgents/com.agentbus.hermes-poll.plist
+
+Logs: $LOG_FILE
+Stats: $STATS_FILE
+INSTALL
+    ;;
+  _run_daemon)
+    # Internal: invoked by start_daemon via nohup
+    echo $$ > "$PID_FILE"
+    # Inherit from exported env vars (not local vars)
+    namespace="${AGENTBUS_NS:-agentbus:v1}"
+    agent="${AGENTBUS_AGENT:-hermes}"
+    project="${AGENTBUS_PROJECT:-}"
+    interval="${AGENTBUS_INTERVAL:-3}"
+    run_daemon
+    ;;
+esac
