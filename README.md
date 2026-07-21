@@ -95,6 +95,16 @@ ZADD agentbus:v1:agents:heartbeat <epoch_seconds> <agent_id>
 
 The Stream is the nervous system. The Array is the searchable local memory.
 
+Or emit the whole thing atomically with one command:
+
+```sh
+bin/agentbus-emit event --project agentbus --agent claude --instance host \
+  --type note --text "AgentBus online" --payload '{"pid":123}'
+```
+
+See `docs/emitting.md` for events, per-instance identity, messages, and
+per-session routing.
+
 ## Agent-To-Agent Messaging
 
 Agents can talk through durable Redis Streams:
@@ -148,7 +158,9 @@ See `docs/extension-requests.md`.
 ## Files
 
 - `docker-compose.yml`: local Redis 8.8 with AOF persistence
+- `bin/agentbus-emit`: one-command atomic event/message emitter
 - `bin/agentbus-poll`: sidecar polling helper for inboxes and channels
+- `docs/emitting.md`: emit helper, per-instance identity, per-session routing
 - `.env.example`: local port, image, namespace
 - `AGENTS.md`: short contract for agents that enter this repo
 - `docs/schema.md`: key schema and event shape

@@ -7,6 +7,8 @@ block_ms=5000
 once=false
 pending=false
 agent=""
+instance=""
+session=""
 project=""
 consumer=""
 group=""
@@ -23,6 +25,10 @@ Usage:
 
 Options:
   --agent <id>        Agent id whose inbox should be polled.
+  --instance <id>     Optional instance suffix: poll agent "<agent>@<instance>"
+                      inbox instead of the shared one (per-instance identity).
+  --session <id>      Also poll the per-session inbox session:<id>:inbox
+                      (per-session direct-message routing).
   --project <id>      Project id for channel polling.
   --channel <id>      Project channel to poll. Can be repeated.
   --consumer <name>   Redis consumer name. Default: <agent_id>:poller:<pid>.
@@ -71,6 +77,10 @@ build_streams() {
   [[ -n "$agent" ]] || die "--agent is required"
   streams=("${namespace}:agent:${agent}:inbox")
 
+  if [[ -n "$session" ]]; then
+    streams+=("${namespace}:session:${session}:inbox")
+  fi
+
   if ((${#channels[@]} > 0)); then
     [[ -n "$project" ]] || die "--project is required when --channel is used"
     local channel
@@ -98,6 +108,10 @@ while (($#)); do
   case "$1" in
     --agent)
       agent="${2:-}"; shift 2 ;;
+    --instance)
+      instance="${2:-}"; shift 2 ;;
+    --session)
+      session="${2:-}"; shift 2 ;;
     --project)
       project="${2:-}"; shift 2 ;;
     --channel)
@@ -126,6 +140,7 @@ while (($#)); do
 done
 
 [[ -n "$agent" ]] || die "--agent is required"
+[[ -n "$instance" ]] && agent="${agent}@${instance}"
 group="${group:-agentbus-poll:${agent}}"
 consumer="${consumer:-${agent}:poller:$$}"
 

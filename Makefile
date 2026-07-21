@@ -5,7 +5,7 @@ AGENTBUS_REDIS_IMAGE ?= redis:8.8.0-alpine
 AGENTBUS_REDIS_PORT ?= 6389
 AGENTBUS_NS ?= agentbus:v1
 
-.PHONY: up down restart logs ping cli init smoke info poll poll-maintainer poll-pending
+.PHONY: up down restart logs ping cli init smoke info emit poll poll-maintainer poll-pending
 
 up:
 	docker compose up -d
@@ -37,6 +37,11 @@ smoke:
 info:
 	docker exec agentbus-redis redis-cli INFO server
 	docker exec agentbus-redis redis-cli ARINFO $(AGENTBUS_NS):log || true
+
+emit:
+	@test -n "$(AGENT)" -a -n "$(PROJECT)" -a -n "$(TEXT)" || (echo "Usage: make emit PROJECT=<id> AGENT=<id> TEXT=<s> [TYPE=<t> INSTANCE=<id> PAYLOAD=<json>]"; exit 2)
+	bin/agentbus-emit event --project "$(PROJECT)" --agent "$(AGENT)" --text "$(TEXT)" \
+		$(if $(TYPE),--type "$(TYPE)") $(if $(INSTANCE),--instance "$(INSTANCE)") $(if $(PAYLOAD),--payload '$(PAYLOAD)')
 
 poll:
 	@test -n "$(AGENT)" || (echo "Usage: make poll AGENT=<agent_id> [PROJECT=<project_id> CHANNEL=<channel_id>]"; exit 2)

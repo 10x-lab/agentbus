@@ -1,0 +1,212 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# agentbus-emit: emit one coherent AgentBus event (or message) atomically.
+#
+# One command writes to the events Stream, the global Array log, and the project
+# Array log, and refreshes projects:active and agents:heartbeat. A direct message
+# or channel message additionally lands in the right delivery Stream. All writes
+# run inside a single Lua EVAL so they are atomic and JSON is built server-side
+# with cjson (no shell quoting of JSON payloads).
+
+namespace="${AGENTBUS_NS:-agentbus:v1}"
+
+agent="${AGENTBUS_AGENT:-}"
+instance="${AGENTBUS_INSTANCE:-}"
+project="${AGENTBUS_PROJECT:-}"
+type="note"
+level="info"
+text=""
+payload="{}"
+
+# message-only
+to=""
+to_session=""
+channel=""
+subject=""
+body=""
+conversation=""
+reply_to=""
+
+cmd="event"
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  bin/agentbus-emit event   --project <id> --agent <id> [--instance <id>] --text <s> [opts]
+  bin/agentbus-emit message --project <id> --agent <id> [--instance <id>] --text <s> \
+                            (--to <agent_id> | --to-session <session_id> | --channel <id>) [opts]
+
+Identity (proposal #1 — per-instance identity):
+  --agent <id>        Base agent id, e.g. claude, codex.        [AGENTBUS_AGENT]
+  --instance <id>     Optional instance suffix. The effective     [AGENTBUS_INSTANCE]
+                      agent id becomes "<agent>@<instance>", e.g.
+                      claude@aol-api. Its inbox and heartbeat are
+                      then distinct from other claude instances.
+
+Common:
+  --project <id>      Project id (slug). Required.               [AGENTBUS_PROJECT]
+  --type <t>          Event type. Default: note (event) / message.direct (message).
+  --level <l>         debug|info|warn|error. Default: info.
+  --text <s>          Short human-readable summary. Required.
+  --payload <json>    Raw JSON object for structured details. Default: {}.
+
+Message routing:
+  --to <agent_id>     Deliver to agent inbox agent:<id>:inbox.
+                      Use a composite id (claude@aol-api) to target one instance.
+  --to-session <id>   Deliver to session inbox session:<id>:inbox (proposal #3 —
+                      per-session routing even when agent id is shared).
+  --channel <id>      Deliver to project channel <id> (needs --project).
+  --subject <s>       Message subject.
+  --body <s>          Message body.
+  --conversation <id> Conversation id for threading.
+  --reply-to <msg_id> Parent message id.
+
+Environment:
+  AGENTBUS_NS         Key namespace. Default: agentbus:v1.
+  AGENTBUS_AGENT/AGENTBUS_INSTANCE/AGENTBUS_PROJECT  Defaults for the flags above.
+
+This always uses Docker:
+  docker exec agentbus-redis redis-cli
+USAGE
+}
+
+die() {
+  echo "agentbus-emit: $*" >&2
+  exit 2
+}
+
+redis() {
+  if ! command -v docker >/dev/null 2>&1; then
+    die "docker is required; AgentBus CLI access must use docker exec agentbus-redis redis-cli"
+  fi
+  docker exec -i agentbus-redis redis-cli "$@"
+}
+
+case "${1:-event}" in
+  event|message)
+    cmd="$1"; shift ;;
+  -h|--help|help)
+    usage; exit 0 ;;
+esac
+
+while (($#)); do
+  case "$1" in
+    --agent) agent="${2:-}"; shift 2 ;;
+    --instance) instance="${2:-}"; shift 2 ;;
+    --project) project="${2:-}"; shift 2 ;;
+    --type) type="${2:-}"; shift 2 ;;
+    --level) level="${2:-}"; shift 2 ;;
+    --text) text="${2:-}"; shift 2 ;;
+    --payload) payload="${2:-}"; shift 2 ;;
+    --to) to="${2:-}"; shift 2 ;;
+    --to-session) to_session="${2:-}"; shift 2 ;;
+    --channel) channel="${2:-}"; shift 2 ;;
+    --subject) subject="${2:-}"; shift 2 ;;
+    --body) body="${2:-}"; shift 2 ;;
+    --conversation) conversation="${2:-}"; shift 2 ;;
+    --reply-to) reply_to="${2:-}"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "unknown argument: $1" ;;
+  esac
+done
+
+[[ -n "$project" ]] || die "--project is required"
+[[ -n "$agent" ]] || die "--agent is required"
+[[ -n "$text" ]] || die "--text is required"
+
+# Effective agent id (proposal #1).
+effective_agent="$agent"
+[[ -n "$instance" ]] && effective_agent="${agent}@${instance}"
+
+ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+epoch="$(date -u +%s)"
+
+# Default type + delivery target for messages.
+target_stream=""
+if [[ "$cmd" == "message" ]]; then
+  [[ "$type" == "note" ]] && type="message.direct"
+  local_targets=0
+  [[ -n "$to" ]] && ((local_targets++)) || true
+  [[ -n "$to_session" ]] && ((local_targets++)) || true
+  [[ -n "$channel" ]] && ((local_targets++)) || true
+  ((local_targets == 1)) || die "message needs exactly one of --to, --to-session, --channel"
+  if [[ -n "$to_session" ]]; then
+    target_stream="${namespace}:session:${to_session}:inbox"
+  elif [[ -n "$channel" ]]; then
+    target_stream="${namespace}:project:${project}:channel:${channel}:messages"
+    [[ "$type" == "message.direct" ]] && type="message.channel"
+  else
+    target_stream="${namespace}:agent:${to}:inbox"
+  fi
+fi
+
+# message_id
+rand="$(printf '%04d' $((RANDOM % 10000)))"
+message_id="msg-$(date -u +%Y%m%d-%H%M%S)-${agent}-${rand}"
+
+events_key="${namespace}:events"
+global_log="${namespace}:log"
+project_log="${namespace}:project:${project}:log"
+active_key="${namespace}:projects:active"
+heartbeat_key="${namespace}:agents:heartbeat"
+
+# Lua builds the JSON with cjson so shell never quotes JSON.
+# KEYS: 1 events 2 global_log 3 project_log 4 active 5 heartbeat 6 target_stream
+# ARGV: 1 ts 2 epoch 3 project 4 agent 5 type 6 level 7 text 8 payload
+#       9 mode 10 message_id 11 to 12 to_session 13 channel 14 subject
+#       15 body 16 conversation 17 reply_to 18 from
+lua='
+local ev = {
+  ts = ARGV[1], epoch = tonumber(ARGV[2]), project = ARGV[3], agent = ARGV[4],
+  type = ARGV[5], level = ARGV[6], text = ARGV[7]
+}
+local ok, p = pcall(cjson.decode, ARGV[8])
+if not ok or type(p) ~= "table" then
+  return redis.error_reply("invalid --payload JSON")
+end
+ev.payload = p
+if ARGV[9] == "message" then
+  ev.message_id = ARGV[10]
+  ev.from = ARGV[18]
+  if ARGV[11] ~= "" then ev.to = ARGV[11] end
+  if ARGV[12] ~= "" then ev.to_session = ARGV[12] end
+  if ARGV[13] ~= "" then ev.channel = ARGV[13] end
+  if ARGV[14] ~= "" then ev.subject = ARGV[14] end
+  if ARGV[15] ~= "" then ev.body = ARGV[15] end
+  if ARGV[16] ~= "" then ev.conversation = ARGV[16] end
+  if ARGV[17] ~= "" then ev.reply_to = ARGV[17] end
+end
+local line = cjson.encode(ev)
+
+redis.call("XADD", KEYS[1], "*",
+  "ts", ARGV[1], "epoch", ARGV[2], "project", ARGV[3], "agent", ARGV[4],
+  "type", ARGV[5], "level", ARGV[6], "text", ARGV[7], "message_id", ARGV[10])
+redis.call("ARINSERT", KEYS[2], line)
+redis.call("ARINSERT", KEYS[3], line)
+redis.call("ZADD", KEYS[4], ARGV[2], ARGV[3])
+redis.call("ZADD", KEYS[5], ARGV[2], ARGV[4])
+
+if ARGV[9] == "message" and KEYS[6] ~= "" then
+  redis.call("XADD", KEYS[6], "*",
+    "ts", ARGV[1], "epoch", ARGV[2], "project", ARGV[3], "agent", ARGV[4],
+    "type", ARGV[5], "level", ARGV[6], "text", ARGV[7],
+    "message_id", ARGV[10], "from", ARGV[18], "to", ARGV[11],
+    "to_session", ARGV[12], "channel", ARGV[13], "subject", ARGV[14],
+    "body", ARGV[15], "conversation", ARGV[16], "reply_to", ARGV[17])
+end
+return ARGV[10]
+'
+
+out="$(redis EVAL "$lua" 6 \
+  "$events_key" "$global_log" "$project_log" "$active_key" "$heartbeat_key" "$target_stream" \
+  "$ts" "$epoch" "$project" "$effective_agent" "$type" "$level" "$text" "$payload" \
+  "$cmd" "$message_id" "$to" "$to_session" "$channel" "$subject" \
+  "$body" "$conversation" "$reply_to" "$effective_agent")"
+
+echo "$out"
+if [[ "$cmd" == "message" ]]; then
+  echo "agentbus-emit: $type from=$effective_agent -> ${to_session:+session:$to_session}${to}${channel:+channel:$channel} id=$out" >&2
+else
+  echo "agentbus-emit: $type by $effective_agent in $project" >&2
+fi
