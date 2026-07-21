@@ -1,0 +1,183 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# agentbus-hook: bridge AgentBus inboxes into a Claude Code Stop hook so agents
+# can talk to each other without a human relaying messages.
+#
+# On "stop", if the hook is enabled and there are new inbox messages, it prints
+# a Claude Code Stop-hook block decision. That forces the model to keep going,
+# handle the messages, reply, and try to stop again. A per-stream cursor makes
+# this terminate on its own: once the new messages are drained, the next stop
+# returns nothing and the model is allowed to finish.
+#
+# Guardrail: a single on/off switch (a Redis key). Default is OFF, so wiring the
+# hook does nothing until you explicitly enable it.
+
+namespace="${AGENTBUS_NS:-agentbus:v1}"
+agent="${AGENTBUS_AGENT:-}"
+instance="${AGENTBUS_INSTANCE:-}"
+session="${AGENTBUS_SESSION:-}"
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  bin/agentbus-hook stop    --agent <id> [--instance <id>] [--session <id>]
+  bin/agentbus-hook on      --agent <id> [--instance <id>]
+  bin/agentbus-hook off     --agent <id> [--instance <id>]
+  bin/agentbus-hook status  --agent <id> [--instance <id>]
+  bin/agentbus-hook install --agent <id> [--instance <id>] [--session <id>]
+
+Subcommands:
+  stop      Stop-hook handler. Reads stdin (the hook payload, ignored) and
+            prints a block decision on stdout when new messages exist.
+  on/off    Enable or disable the hook for this (effective) agent id.
+  status    Print enabled|disabled for this agent id.
+  install   Print the settings.json snippet to wire the Stop hook.
+
+Identity:
+  --agent/--instance form the effective id "<agent>@<instance>". The stop
+  handler drains the shared inbox (agent:<agent>:inbox), the instance inbox
+  (agent:<agent>@<instance>:inbox), and, if given, the session inbox
+  (session:<session>:inbox).
+
+Environment:
+  AGENTBUS_NS/AGENTBUS_AGENT/AGENTBUS_INSTANCE/AGENTBUS_SESSION as defaults.
+
+Always uses Docker:
+  docker exec agentbus-redis redis-cli
+USAGE
+}
+
+die() { echo "agentbus-hook: $*" >&2; exit 2; }
+
+redis() {
+  command -v docker >/dev/null 2>&1 || die "docker is required (docker exec agentbus-redis redis-cli)"
+  docker exec -i agentbus-redis redis-cli "$@"
+}
+
+cmd="${1:-stop}"
+case "$cmd" in
+  stop|on|off|status|install) shift || true ;;
+  -h|--help|help) usage; exit 0 ;;
+  *) die "unknown subcommand: $cmd" ;;
+esac
+
+while (($#)); do
+  case "$1" in
+    --agent) agent="${2:-}"; shift 2 ;;
+    --instance) instance="${2:-}"; shift 2 ;;
+    --session) session="${2:-}"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "unknown argument: $1" ;;
+  esac
+done
+
+[[ -n "$agent" ]] || die "--agent is required"
+
+label="$agent"
+[[ -n "$instance" ]] && label="${agent}@${instance}"
+
+enabled_key="${namespace}:hook:${label}:enabled"
+
+case "$cmd" in
+  on)
+    redis SET "$enabled_key" 1 >/dev/null
+    echo "agentbus-hook: enabled for $label" >&2 ;;
+  off)
+    redis SET "$enabled_key" 0 >/dev/null
+    echo "agentbus-hook: disabled for $label" >&2 ;;
+  status)
+    v="$(redis GET "$enabled_key")"
+    [[ "$v" == "1" ]] && echo "enabled" || echo "disabled" ;;
+  install)
+    self="$(cd "$(dirname "$0")" && pwd)/agentbus-hook"
+    line="$self stop --agent $agent"
+    [[ -n "$instance" ]] && line="$line --instance $instance"
+    [[ -n "$session" ]] && line="$line --session $session"
+    cat <<JSON
+Add to .claude/settings.json (project) or ~/.claude/settings.json (global):
+
+{
+  "hooks": {
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "$line" } ] }
+    ]
+  }
+}
+
+Then enable it (default is OFF):
+
+  $self on --agent $agent${instance:+ --instance $instance}
+JSON
+    ;;
+  stop)
+    cat >/dev/null 2>&1 || true   # consume the hook payload on stdin
+
+    shared_inbox="${namespace}:agent:${agent}:inbox"
+    shared_cursor="${namespace}:hook:${label}:cursor:shared"
+    inst_inbox=""; inst_cursor=""
+    if [[ -n "$instance" ]]; then
+      inst_inbox="${namespace}:agent:${label}:inbox"
+      inst_cursor="${namespace}:hook:${label}:cursor:instance"
+    fi
+    sess_inbox=""; sess_cursor=""
+    if [[ -n "$session" ]]; then
+      sess_inbox="${namespace}:session:${session}:inbox"
+      sess_cursor="${namespace}:hook:${label}:cursor:session"
+    fi
+
+    # KEYS: 1 enabled 2 sharedInbox 3 sharedCursor 4 instInbox 5 instCursor
+    #       6 sessInbox 7 sessCursor   ARGV: 1 label
+    lua='
+      if redis.call("GET", KEYS[1]) ~= "1" then return "" end
+      local out = {}
+      local function drain(streamKey, cursorKey)
+        if streamKey == "" then return end
+        local cursor = redis.call("GET", cursorKey)
+        if not cursor then
+          local last = redis.call("XREVRANGE", streamKey, "+", "-", "COUNT", 1)
+          local lastId = "0-0"
+          if last[1] then lastId = last[1][1] end
+          redis.call("SET", cursorKey, lastId)
+          return
+        end
+        local msgs = redis.call("XRANGE", streamKey, "(" .. cursor, "+", "COUNT", 50)
+        for _, m in ipairs(msgs) do
+          local id = m[1]
+          local f = {}
+          local arr = m[2]
+          for i = 1, #arr, 2 do f[arr[i]] = arr[i + 1] end
+          local line = "- [" .. id .. "] from=" .. (f.from or f.agent or "?")
+          if f["type"] then line = line .. " type=" .. f["type"] end
+          if f.subject and f.subject ~= "" then line = line .. " subject=\"" .. f.subject .. "\"" end
+          if f.conversation and f.conversation ~= "" then line = line .. " conversation=" .. f.conversation end
+          line = line .. "\n  message_id=" .. (f.message_id or "?")
+          local content = f.body
+          if not content or content == "" then content = f.text end
+          if content and content ~= "" then line = line .. "\n  " .. content end
+          table.insert(out, line)
+          redis.call("SET", cursorKey, id)
+        end
+      end
+      drain(KEYS[2], KEYS[3])
+      drain(KEYS[4], KEYS[5])
+      drain(KEYS[6], KEYS[7])
+      if #out == 0 then return "" end
+      local body = table.concat(out, "\n")
+      local reason = "AgentBus: " .. #out .. " nuovo/i messaggio/i in inbox per " .. ARGV[1] ..
+        ".\n" .. body ..
+        "\n\nAgisci ora: leggi, esegui la richiesta, e rispondi con bin/agentbus-emit message " ..
+        "(riusa lo stesso conversation, imposta --reply-to al message_id). " ..
+        "Quando la conversazione e risolta, fermati normalmente."
+      return cjson.encode({decision = "block", reason = reason})
+    '
+
+    out="$(redis EVAL "$lua" 7 \
+      "$enabled_key" "$shared_inbox" "$shared_cursor" \
+      "$inst_inbox" "$inst_cursor" "$sess_inbox" "$sess_cursor" \
+      "$label")"
+
+    [[ -n "$out" ]] && printf '%s\n' "$out"
+    exit 0
+    ;;
+esac
