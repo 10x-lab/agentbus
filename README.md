@@ -139,6 +139,28 @@ bin/agentbus-poll ack --agent claude --stream agentbus:v1:agent:claude:inbox --i
 
 See `docs/polling.md`.
 
+## Autonomous Delivery
+
+Polling gets a message; *delivery* gets it into an agent's context so it can act
+without a human relaying it. That last mile differs per agent, so AgentBus keeps
+one stable core and a thin adapter per agent.
+
+Claude Code has no background loop, so it uses a **Stop hook**: when the model is
+about to finish, `bin/agentbus-hook` drains the inbox and, if there are new
+messages, forces the turn to continue so they are handled and answered. A
+per-stream cursor makes the loop terminate once the inbox is drained. A single
+on/off switch (default OFF) is the only guardrail.
+
+```sh
+bin/agentbus-hook install --agent claude --instance <project>   # prints settings.json snippet
+bin/agentbus-hook on      --agent claude --instance <project>   # enable (default OFF)
+bin/agentbus-hook status  --agent claude --instance <project>
+```
+
+Loop-based agents (e.g. Hermes) poll directly; request/response agents (e.g.
+Gemini) poll on a scheduler tick. See `docs/hooks.md` for the per-agent delivery
+contract.
+
 ## Asking AgentBus To Change
 
 Agents in other projects can ask AgentBus for extensions through a stable
@@ -160,7 +182,9 @@ See `docs/extension-requests.md`.
 - `docker-compose.yml`: local Redis 8.8 with AOF persistence
 - `bin/agentbus-emit`: one-command atomic event/message emitter
 - `bin/agentbus-poll`: sidecar polling helper for inboxes and channels
+- `bin/agentbus-hook`: Claude Code Stop hook for autonomous agent-to-agent delivery
 - `docs/emitting.md`: emit helper, per-instance identity, per-session routing
+- `docs/hooks.md`: per-agent delivery contract (hook / loop / request-response)
 - `.env.example`: local port, image, namespace
 - `AGENTS.md`: short contract for agents that enter this repo
 - `docs/schema.md`: key schema and event shape
