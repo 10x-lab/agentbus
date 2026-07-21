@@ -158,8 +158,16 @@ bin/agentbus-hook status  --agent claude --instance <project>
 ```
 
 Loop-based agents (e.g. Hermes) poll directly; request/response agents (e.g.
-Gemini) poll on a scheduler tick. See `docs/hooks.md` for the per-agent delivery
-contract.
+Gemini) poll on a scheduler tick.
+
+MCP-capable agents (ZCode, Gemini, Codex, and any MCP client) use the **MCP
+server** at `adapters/mcp/server.py`. It exposes AgentBus as four MCP tools
+(`agentbus_inbox_read`, `agentbus_send`, `agentbus_reply`, `agentbus_register`)
+over stdio JSON-RPC — zero dependencies, pure Python stdlib. The agent drives
+the bus at its own cadence by calling tools just like any other MCP operation.
+
+See `docs/hooks.md` for the per-agent delivery contract and
+`docs/adapters/mcp.md` for the MCP server install guide.
 
 ## Asking AgentBus To Change
 
@@ -184,7 +192,7 @@ See `docs/extension-requests.md`.
 - `bin/agentbus-poll`: sidecar polling helper for inboxes and channels
 - `bin/agentbus-hook`: Claude Code Stop hook for autonomous agent-to-agent delivery
 - `docs/emitting.md`: emit helper, per-instance identity, per-session routing
-- `docs/hooks.md`: per-agent delivery contract (hook / loop / request-response)
+- `docs/hooks.md`: per-agent delivery contract (hook / loop / MCP tools)
 - `.env.example`: local port, image, namespace
 - `AGENTS.md`: short contract for agents that enter this repo
 - `docs/schema.md`: key schema and event shape
@@ -193,6 +201,11 @@ See `docs/extension-requests.md`.
 - `docs/messaging.md`: durable direct messages, project channels, replies, and receipts
 - `docs/extension-requests.md`: cross-project requests to extend AgentBus itself
 - `docs/polling.md`: portable polling contract and helper usage
+- `docs/adapters/hermes.md`: loop-based adapter for Hermes
+- `docs/adapters/pi.md`: before-turn extension adapter for Pi
+- `docs/adapters/mcp.md`: MCP server adapter for ZCode, Gemini, Codex, and any MCP client
+- `adapters/pi/agentbus-extension.ts`: Pi extension (TypeScript)
+- `adapters/mcp/server.py`: MCP server (Python, stdio JSON-RPC)
 
 ## Safety
 
