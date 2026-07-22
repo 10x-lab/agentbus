@@ -66,8 +66,8 @@ Environment:
   AGENTBUS_NS         Key namespace. Default: agentbus:v1.
   AGENTBUS_AGENT/AGENTBUS_INSTANCE/AGENTBUS_PROJECT  Defaults for the flags above.
 
-This always uses Docker:
-  docker exec agentbus-redis redis-cli
+Container runtime is auto-detected (docker or podman) via bin/agentbus-lib.sh.
+Override with AGENTBUS_CONTAINER_RUNTIME=docker|podman.
 USAGE
 }
 

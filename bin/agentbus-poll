@@ -31,7 +31,8 @@ Options:
                       (per-session direct-message routing).
   --project <id>      Project id for channel polling.
   --channel <id>      Project channel to poll. Can be repeated.
-  --consumer <name>   Redis consumer name. Default: <agent_id>:poller:<pid>.
+  --consumer <name>   Redis consumer name. Default: <agent_id>:poller (stable, so
+                      pending messages survive across poll runs).
   --group <name>      Redis consumer group. Default: agentbus-poll:<agent_id>.
   --count <n>         Max messages per read. Default: 20.
   --block-ms <n>      XREADGROUP block time. Default: 5000. Use 0 to block forever.
@@ -43,8 +44,8 @@ Options:
 Environment:
   AGENTBUS_NS         Redis key namespace. Default: agentbus:v1.
 
-This always uses Docker:
-  docker exec agentbus-redis redis-cli --raw
+Container runtime is auto-detected (docker or podman) via bin/agentbus-lib.sh.
+Override with AGENTBUS_CONTAINER_RUNTIME=docker|podman.
 USAGE
 }
 
@@ -144,7 +145,7 @@ done
 [[ -n "$agent" ]] || die "--agent is required"
 [[ -n "$instance" ]] && agent="${agent}@${instance}"
 group="${group:-agentbus-poll:${agent}}"
-consumer="${consumer:-${agent}:poller:$$}"
+consumer="${consumer:-${agent}:poller}"
 
 case "$cmd" in
   read)
