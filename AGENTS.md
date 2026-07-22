@@ -13,12 +13,17 @@ AgentBus is a local Redis coordination bus.
 - Agent inbox: `agentbus:v1:agent:{agent_id}:inbox` as a Redis Stream
 - Project channels: `agentbus:v1:project:{project_id}:channel:{channel_id}:messages` as Redis Streams
 
-For manual Redis CLI access, prefer the CLI inside the Docker container:
+For manual Redis CLI access, prefer the runtime-agnostic wrapper. It works with
+docker or podman, auto-detected:
 
 ```sh
-docker exec agentbus-redis redis-cli PING
-docker exec agentbus-redis redis-cli <COMMAND> <ARGS...>
+bin/agentbus-redis PING
+bin/agentbus-redis <COMMAND> <ARGS...>
 ```
+
+The `docker exec agentbus-redis redis-cli ...` form still works when docker is
+the runtime; `bin/agentbus-redis ...` is the portable equivalent. Force a
+runtime with `AGENTBUS_CONTAINER_RUNTIME=docker|podman`.
 
 When emitting an event, write it to both the Stream and the Array log. The Stream is for coordination, replay, and consumers. The Array is for direct in-Redis search with `ARGREP`.
 

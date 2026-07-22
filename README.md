@@ -45,15 +45,26 @@ docker exec agentbus-redis redis-cli XGROUP CREATE agentbus:v1:events export-jso
 
 If the consumer group already exists, Redis returns `BUSYGROUP`; that is fine.
 
+## Container Runtime
+
+AgentBus is runtime-agnostic: docker and podman both work, auto-detected (the
+runtime that actually runs the `agentbus-redis` container wins). Force a choice
+with `AGENTBUS_CONTAINER_RUNTIME=docker|podman` when both are installed. All
+`bin/` helpers, the Makefile, and the MCP server share this detection
+(`bin/agentbus-lib.sh`).
+
 ## Direct Agent Usage
 
-Use the CLI inside the running Docker container from any directory. Do not use a
+Prefer the runtime-agnostic wrapper from any directory. Do not use a
 host-installed `redis-cli` for AgentBus operations:
 
 ```sh
-docker exec agentbus-redis redis-cli PING
-docker exec agentbus-redis redis-cli ARGREP agentbus:v1:log - + MATCH "agentbus" NOCASE WITHVALUES LIMIT 20
+bin/agentbus-redis PING
+bin/agentbus-redis ARGREP agentbus:v1:log - + MATCH "agentbus" NOCASE WITHVALUES LIMIT 20
 ```
+
+The `docker exec agentbus-redis redis-cli …` form in older examples still works
+when docker is the runtime; `bin/agentbus-redis …` is the portable equivalent.
 
 Emit to the Stream:
 
@@ -149,10 +160,13 @@ Claude Code has no background loop, so it uses a **Stop hook**: when the model i
 about to finish, `bin/agentbus-hook` drains the inbox and, if there are new
 messages, forces the turn to continue so they are handled and answered. A
 per-stream cursor makes the loop terminate once the inbox is drained. A single
-on/off switch (default OFF) is the only guardrail.
+on/off switch (default OFF) is the only guardrail. Kimi Code has a blockable
+Stop hook too, with a different contract (exit code 2 + stderr reason);
+`bin/agentbus-hook --format kimi` speaks it.
 
 ```sh
 bin/agentbus-hook install --agent claude --instance <project>   # prints settings.json snippet
+bin/agentbus-hook install --agent kimi --instance <project> --format kimi   # prints config.toml snippet
 bin/agentbus-hook on      --agent claude --instance <project>   # enable (default OFF)
 bin/agentbus-hook status  --agent claude --instance <project>
 ```
@@ -193,9 +207,11 @@ See `docs/extension-requests.md`.
 ## Files
 
 - `docker-compose.yml`: local Redis 8.8 with AOF persistence
+- `bin/agentbus-lib.sh`: shared docker/podman runtime detection (sourced by helpers)
+- `bin/agentbus-redis`: runtime-agnostic `redis-cli` into the container
 - `bin/agentbus-emit`: one-command atomic event/message emitter
 - `bin/agentbus-poll`: sidecar polling helper for inboxes and channels
-- `bin/agentbus-hook`: Claude Code Stop hook for autonomous agent-to-agent delivery
+- `bin/agentbus-hook`: Stop hook for Claude Code and Kimi Code (`--format`) for autonomous agent-to-agent delivery
 - `docs/emitting.md`: emit helper, per-instance identity, per-session routing
 - `docs/hooks.md`: per-agent delivery contract (hook / loop / MCP tools)
 - `.env.example`: local port, image, namespace
@@ -208,6 +224,7 @@ See `docs/extension-requests.md`.
 - `docs/polling.md`: portable polling contract and helper usage
 - `docs/adapters/hermes.md`: loop-based adapter for Hermes
 - `docs/adapters/pi.md`: before-turn extension adapter for Pi
+- `docs/adapters/kimi.md`: Stop-hook adapter for Kimi Code (polling included)
 - `docs/adapters/mcp.md`: MCP server adapter for ZCode, Gemini, Codex, and any MCP client
 - `adapters/pi/agentbus-extension.ts`: Pi extension (TypeScript)
 - `adapters/hermes/agentbus-hermes-poll`: Hermes native polling daemon (Bash)

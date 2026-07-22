@@ -24,6 +24,7 @@ Environment:
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -35,6 +36,47 @@ AGENTBUS_BIN = os.environ.get(
     "AGENTBUS_BIN",
     os.path.join(os.path.dirname(__file__), "..", "..", "bin"),
 )
+AGENTBUS_CONTAINER = os.environ.get("AGENTBUS_CONTAINER", "agentbus-redis")
+
+_RUNTIME_CACHE: str | None = None
+
+
+def _container_runtime() -> str:
+    """Detect the container runtime (docker or podman), agnostic to the host.
+
+    Order: explicit AGENTBUS_CONTAINER_RUNTIME, then whichever runtime actually
+    runs the agentbus container, then the first available binary.
+    """
+    global _RUNTIME_CACHE
+    if _RUNTIME_CACHE:
+        return _RUNTIME_CACHE
+
+    override = os.environ.get("AGENTBUS_CONTAINER_RUNTIME")
+    if override:
+        _RUNTIME_CACHE = override
+        return override
+
+    for rt in ("docker", "podman"):
+        if not shutil.which(rt):
+            continue
+        try:
+            out = subprocess.run(
+                [rt, "ps", "--format", "{{.Names}}"],
+                capture_output=True, text=True, timeout=10,
+            ).stdout.splitlines()
+            if AGENTBUS_CONTAINER in out:
+                _RUNTIME_CACHE = rt
+                return rt
+        except Exception:
+            continue
+
+    for rt in ("docker", "podman"):
+        if shutil.which(rt):
+            _RUNTIME_CACHE = rt
+            return rt
+
+    _RUNTIME_CACHE = "docker"
+    return _RUNTIME_CACHE
 AGENT = os.environ.get("AGENTBUS_AGENT", "mcp-agent")
 INSTANCE = os.environ.get("AGENTBUS_INSTANCE", "")
 PROJECT = os.environ.get("AGENTBUS_PROJECT", "")
@@ -332,7 +374,7 @@ def tool_register(args: dict) -> str:
     # Check current heartbeat
     try:
         hb_raw = _run([
-            "docker", "exec", "agentbus-redis", "redis-cli",
+            _container_runtime(), "exec", AGENTBUS_CONTAINER, "redis-cli",
             "ZSCORE", "agentbus:v1:agents:heartbeat", EFFECTIVE,
         ])
     except RuntimeError:

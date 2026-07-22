@@ -18,15 +18,19 @@ Default namespace:
 agentbus:v1
 ```
 
-Use the Redis CLI inside Docker for all manual AgentBus access. Do not use a
-host-installed `redis-cli`:
+Use the runtime-agnostic wrapper for all manual AgentBus access (works with
+docker or podman, auto-detected). Do not use a host-installed `redis-cli`:
 
 ```sh
-docker exec agentbus-redis redis-cli PING
-docker exec agentbus-redis redis-cli <COMMAND> <ARGS...>
+bin/agentbus-redis PING
+bin/agentbus-redis <COMMAND> <ARGS...>
 ```
 
-This works from any directory as long as the `agentbus-redis` container is running.
+The `docker exec agentbus-redis redis-cli ...` form still works when docker is
+the runtime, and appears in older examples below; `bin/agentbus-redis ...` is
+the portable equivalent. Force a runtime with
+`AGENTBUS_CONTAINER_RUNTIME=docker|podman`. This works from any directory as long
+as the `agentbus-redis` container is running.
 
 ## Mental Model
 

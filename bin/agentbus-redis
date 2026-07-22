@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# agentbus-redis — runtime-agnostic redis-cli into the agentbus container.
+#
+# Replaces `docker exec agentbus-redis redis-cli <ARGS>` with a command that
+# works whether the container runs under docker or podman. Detection order:
+# AGENTBUS_CONTAINER_RUNTIME, then the runtime that runs the container, then the
+# first available binary.
+#
+#   bin/agentbus-redis PING
+#   bin/agentbus-redis ARGREP agentbus:v1:log - + MATCH "error" NOCASE WITHVALUES LIMIT 20
+
+_root="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+while [ "$_root" != "/" ] && [ ! -f "$_root/bin/agentbus-lib.sh" ]; do _root="$(dirname "$_root")"; done
+if [ ! -f "$_root/bin/agentbus-lib.sh" ]; then
+  echo "agentbus-redis: agentbus-lib.sh not found" >&2
+  exit 2
+fi
+. "$_root/bin/agentbus-lib.sh"
+
+case "${1:-}" in
+  -h|--help|help)
+    cat <<'USAGE'
+Usage: bin/agentbus-redis <redis-cli args...>
+Runs redis-cli inside the agentbus container (docker or podman, auto-detected).
+
+Environment:
+  AGENTBUS_CONTAINER_RUNTIME  force docker|podman (or a full path)
+  AGENTBUS_CONTAINER          container name (default: agentbus-redis)
+USAGE
+    exit 0 ;;
+esac
+
+exec_runtime="$(agentbus_runtime)"
+if ! command -v "$exec_runtime" >/dev/null 2>&1; then
+  echo "agentbus-redis: no container runtime found (docker or podman); set AGENTBUS_CONTAINER_RUNTIME" >&2
+  exit 2
+fi
+
+exec "$exec_runtime" exec -i "${AGENTBUS_CONTAINER:-agentbus-redis}" redis-cli "$@"

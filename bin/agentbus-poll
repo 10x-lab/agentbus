@@ -53,11 +53,13 @@ die() {
   exit 2
 }
 
+_root="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+while [ "$_root" != "/" ] && [ ! -f "$_root/bin/agentbus-lib.sh" ]; do _root="$(dirname "$_root")"; done
+[ -f "$_root/bin/agentbus-lib.sh" ] && . "$_root/bin/agentbus-lib.sh"
+
 redis() {
-  if ! command -v docker >/dev/null 2>&1; then
-    die "docker is required; AgentBus CLI access must use docker exec agentbus-redis redis-cli"
-  fi
-  docker exec agentbus-redis redis-cli --raw "$@"
+  command -v agentbus_redis >/dev/null 2>&1 || die "agentbus-lib.sh not found; cannot reach the agentbus-redis container"
+  agentbus_redis --raw "$@"
 }
 
 ensure_group() {

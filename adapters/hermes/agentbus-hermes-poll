@@ -37,7 +37,11 @@ AGENTBUS_BIN="$(cd "$(dirname "$0")/../../bin" && pwd)"
 # Helpers
 # ---------------------------------------------------------------------------
 die()  { echo "agentbus-hermes-poll: $*" >&2; exit 2; }
-redis() { docker exec agentbus-redis redis-cli --raw "$@"; }
+[ -f "$AGENTBUS_BIN/agentbus-lib.sh" ] && . "$AGENTBUS_BIN/agentbus-lib.sh"
+redis() {
+  command -v agentbus_redis >/dev/null 2>&1 || die "agentbus-lib.sh not found; cannot reach the agentbus-redis container"
+  agentbus_redis --raw "$@"
+}
 log()  { echo "[$(date -u +%H:%M:%S)] $*" >> "$LOG_FILE"; }
 stats() { echo "$1" >> "$STATS_FILE"; }
 

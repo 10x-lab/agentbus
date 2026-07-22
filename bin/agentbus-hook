@@ -1,14 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# agentbus-hook: bridge AgentBus inboxes into a Claude Code Stop hook so agents
+# agentbus-hook: bridge AgentBus inboxes into an agent CLI Stop hook so agents
 # can talk to each other without a human relaying messages.
 #
-# On "stop", if the hook is enabled and there are new inbox messages, it prints
-# a Claude Code Stop-hook block decision. That forces the model to keep going,
-# handle the messages, reply, and try to stop again. A per-stream cursor makes
-# this terminate on its own: once the new messages are drained, the next stop
-# returns nothing and the model is allowed to finish.
+# On "stop", if the hook is enabled and there are new inbox messages, it blocks
+# the stop. That forces the model to keep going, handle the messages, reply,
+# and try to stop again. A per-stream cursor makes this terminate on its own:
+# once the new messages are drained, the next stop returns nothing and the
+# model is allowed to finish.
+#
+# Output formats (--format):
+#   claude (default) — prints a Claude Code Stop-hook block decision JSON on
+#                      stdout, exits 0.
+#   kimi             — prints the reason on stderr and exits 2, which is how a
+#                      Kimi Code Stop hook blocks and tells the model to continue.
 #
 # Guardrail: a single on/off switch (a Redis key). Default is OFF, so wiring the
 # hook does nothing until you explicitly enable it.
@@ -17,22 +23,29 @@ namespace="${AGENTBUS_NS:-agentbus:v1}"
 agent="${AGENTBUS_AGENT:-}"
 instance="${AGENTBUS_INSTANCE:-}"
 session="${AGENTBUS_SESSION:-}"
+format="${AGENTBUS_HOOK_FORMAT:-claude}"
 
 usage() {
   cat <<'USAGE'
 Usage:
-  bin/agentbus-hook stop    --agent <id> [--instance <id>] [--session <id>]
+  bin/agentbus-hook stop    --agent <id> [--instance <id>] [--session <id>] [--format claude|kimi]
   bin/agentbus-hook on      --agent <id> [--instance <id>]
   bin/agentbus-hook off     --agent <id> [--instance <id>]
   bin/agentbus-hook status  --agent <id> [--instance <id>]
-  bin/agentbus-hook install --agent <id> [--instance <id>] [--session <id>]
+  bin/agentbus-hook install --agent <id> [--instance <id>] [--session <id>] [--format claude|kimi]
 
 Subcommands:
   stop      Stop-hook handler. Reads stdin (the hook payload, ignored) and
-            prints a block decision on stdout when new messages exist.
+            blocks the stop when new messages exist (claude: block decision
+            JSON on stdout, exit 0; kimi: reason on stderr, exit 2).
   on/off    Enable or disable the hook for this (effective) agent id.
-  status    Print enabled|disabled for this agent id.
-  install   Print the settings.json snippet to wire the Stop hook.
+            Without --instance it sets the agent-level default, which applies
+            to every instance of that agent that has no per-instance key.
+            A per-instance `off` always wins over the agent-level default.
+  status    Print enabled|disabled for this agent id (shows when the state
+            comes from the agent-level default).
+  install   Print the settings snippet to wire the Stop hook for the
+            selected format (Claude Code settings.json or Kimi Code config.toml).
 
 Identity:
   --agent/--instance form the effective id "<agent>@<instance>". The stop
@@ -42,6 +55,7 @@ Identity:
 
 Environment:
   AGENTBUS_NS/AGENTBUS_AGENT/AGENTBUS_INSTANCE/AGENTBUS_SESSION as defaults.
+  AGENTBUS_HOOK_FORMAT as default for --format.
 
 Always uses Docker:
   docker exec agentbus-redis redis-cli
@@ -50,9 +64,13 @@ USAGE
 
 die() { echo "agentbus-hook: $*" >&2; exit 2; }
 
+_root="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+while [ "$_root" != "/" ] && [ ! -f "$_root/bin/agentbus-lib.sh" ]; do _root="$(dirname "$_root")"; done
+[ -f "$_root/bin/agentbus-lib.sh" ] && . "$_root/bin/agentbus-lib.sh"
+
 redis() {
-  command -v docker >/dev/null 2>&1 || die "docker is required (docker exec agentbus-redis redis-cli)"
-  docker exec -i agentbus-redis redis-cli "$@"
+  command -v agentbus_redis >/dev/null 2>&1 || die "agentbus-lib.sh not found; cannot reach the agentbus-redis container"
+  agentbus_redis "$@"
 }
 
 cmd="${1:-stop}"
@@ -67,17 +85,20 @@ while (($#)); do
     --agent) agent="${2:-}"; shift 2 ;;
     --instance) instance="${2:-}"; shift 2 ;;
     --session) session="${2:-}"; shift 2 ;;
+    --format) format="${2:-}"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown argument: $1" ;;
   esac
 done
 
 [[ -n "$agent" ]] || die "--agent is required"
+[[ "$format" == "claude" || "$format" == "kimi" ]] || die "--format must be claude or kimi"
 
 label="$agent"
 [[ -n "$instance" ]] && label="${agent}@${instance}"
 
 enabled_key="${namespace}:hook:${label}:enabled"
+agent_enabled_key="${namespace}:hook:${agent}:enabled"
 
 case "$cmd" in
   on)
@@ -88,13 +109,34 @@ case "$cmd" in
     echo "agentbus-hook: disabled for $label" >&2 ;;
   status)
     v="$(redis GET "$enabled_key")"
-    [[ "$v" == "1" ]] && echo "enabled" || echo "disabled" ;;
+    if [[ "$v" == "1" ]]; then
+      echo "enabled"
+    elif [[ -z "$v" && "$enabled_key" != "$agent_enabled_key" ]] \
+      && [[ "$(redis GET "$agent_enabled_key")" == "1" ]]; then
+      echo "enabled (agent-level default)"
+    else
+      echo "disabled"
+    fi ;;
   install)
     self="$(cd "$(dirname "$0")" && pwd)/agentbus-hook"
     line="$self stop --agent $agent"
     [[ -n "$instance" ]] && line="$line --instance $instance"
     [[ -n "$session" ]] && line="$line --session $session"
-    cat <<JSON
+    if [[ "$format" == "kimi" ]]; then
+      cat <<JSON
+Add to ~/.kimi-code/config.toml:
+
+[[hooks]]
+event = "Stop"
+command = "$line --format kimi"
+timeout = 10
+
+Then enable it (default is OFF):
+
+  $self on --agent $agent${instance:+ --instance $instance}
+JSON
+    else
+      cat <<JSON
 Add to .claude/settings.json (project) or ~/.claude/settings.json (global):
 
 {
@@ -109,6 +151,7 @@ Then enable it (default is OFF):
 
   $self on --agent $agent${instance:+ --instance $instance}
 JSON
+    fi
     ;;
   stop)
     cat >/dev/null 2>&1 || true   # consume the hook payload on stdin
@@ -127,9 +170,20 @@ JSON
     fi
 
     # KEYS: 1 enabled 2 sharedInbox 3 sharedCursor 4 instInbox 5 instCursor
-    #       6 sessInbox 7 sessCursor   ARGV: 1 label
+    #       6 sessInbox 7 sessCursor 8 agentEnabled
+    # ARGV: 1 label 2 format
+    # Enabled when the per-label key is "1", or when it is unset and the
+    # agent-level key (set with `on --agent <id>` without --instance) is "1".
+    # A per-label "0" always wins over the agent-level default.
     lua='
-      if redis.call("GET", KEYS[1]) ~= "1" then return "" end
+      local en = redis.call("GET", KEYS[1])
+      if en ~= "1" then
+        if en == false and redis.call("GET", KEYS[8]) == "1" then
+          -- agent-level default ON
+        else
+          return ""
+        end
+      end
       local out = {}
       local function drain(streamKey, cursorKey)
         if streamKey == "" then return end
@@ -169,15 +223,23 @@ JSON
         "\n\nAgisci ora: leggi, esegui la richiesta, e rispondi con bin/agentbus-emit message " ..
         "(riusa lo stesso conversation, imposta --reply-to al message_id). " ..
         "Quando la conversazione e risolta, fermati normalmente."
+      if ARGV[2] == "kimi" then return reason end
       return cjson.encode({decision = "block", reason = reason})
     '
 
-    out="$(redis EVAL "$lua" 7 \
+    out="$(redis EVAL "$lua" 8 \
       "$enabled_key" "$shared_inbox" "$shared_cursor" \
       "$inst_inbox" "$inst_cursor" "$sess_inbox" "$sess_cursor" \
-      "$label")"
+      "$agent_enabled_key" \
+      "$label" "$format")"
 
-    [[ -n "$out" ]] && printf '%s\n' "$out"
+    if [[ -n "$out" ]]; then
+      if [[ "$format" == "kimi" ]]; then
+        printf '%s\n' "$out" >&2
+        exit 2
+      fi
+      printf '%s\n' "$out"
+    fi
     exit 0
     ;;
 esac

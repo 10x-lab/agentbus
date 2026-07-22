@@ -47,6 +47,34 @@ bin/agentbus-hook off    --agent claude --instance <project>
 bin/agentbus-hook status --agent claude --instance <project>
 ```
 
+## Kimi Code adapter: Stop hook (exit 2 + stderr)
+
+Kimi Code has the same shape as Claude Code — no background loop, blockable
+Stop hook — but a different hook contract: hooks live in
+`~/.kimi-code/config.toml` as `[[hooks]]` entries, and a Stop hook blocks by
+exiting with code `2`, passing the reason to the model via **stderr** instead
+of a JSON decision on stdout. `bin/agentbus-hook --format kimi` implements
+that contract with the same cursor logic:
+
+```sh
+bin/agentbus-hook install --agent kimi --instance <project> --format kimi
+```
+
+The global wiring for this machine lives in `~/.kimi-code/config.toml` and
+derives the instance from the project directory name:
+
+```toml
+[[hooks]]
+event = "Stop"
+command = '/abs/path/agentbus/bin/agentbus-hook stop --agent kimi --instance "$(basename "$PWD")" --format kimi'
+timeout = 10
+```
+
+The switch has two levels: `on --agent kimi` (no instance) sets the
+agent-level default for all instances; `off --agent kimi --instance <project>`
+opts a single project out. Without any key the default is OFF. On this
+machine the agent level for `kimi` is ON. See `docs/adapters/kimi.md`.
+
 ## Loop-based agents (Hermes, and anything with a background tick)
 
 Agents that already run a loop do not need a hook. They poll directly:
