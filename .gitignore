@@ -3,3 +3,10 @@
 *.log
 tmp/
 .claude/settings.local.json
+
+# python bytecode
+__pycache__/
+*.pyc
+
+# Pi local config
+.pi/
